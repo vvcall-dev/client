@@ -41,13 +41,17 @@ jobs:
         shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
+      - name: Rename binary for release
+        shell: bash
+        run: mv target/release/p2p-voice.exe target/release/p2p-voice-windows.exe
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ steps.get_version.outputs.VERSION }}
           draft: false
           prerelease: false
-          files: target/release/p2p-voice.exe
+          files: target/release/p2p-voice-windows.exe
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -91,13 +95,17 @@ jobs:
         shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
+      - name: Rename binary for release
+        shell: bash
+        run: mv target/release/p2p-voice target/release/p2p-voice-linux
+
       - name: Upload Linux Release
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ steps.get_version.outputs.VERSION }}
           draft: false
           prerelease: false
-          files: target/release/p2p-voice
+          files: target/release/p2p-voice-linux
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -106,4 +114,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: p2p-voice-linux
-          path: target/release/p2p-voice
+          path: target/release/p2p-voice-linux
