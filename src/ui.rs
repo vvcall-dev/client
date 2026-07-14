@@ -7,7 +7,7 @@ use std::time::Instant;
 
 pub fn render(ctx: &egui::Context, app: &mut P2PApp) {
     egui::SidePanel::left("controls")
-        .default_width(240.0)
+        .exact_width(280.0)
         .resizable(false)
         .show(ctx, |ui| {
             ui.add_space(11.0);
@@ -16,23 +16,33 @@ pub fn render(ctx: &egui::Context, app: &mut P2PApp) {
             ui.separator();
             ui.add_space(5.0);
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                draw_connection(ui, app);
-                ui.add_space(15.0);
-                draw_devices(ui, app);
-                ui.add_space(15.0);
-                draw_controls(ui, app);
-
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    ui.add_space(10.0);
-                    let status = app.status_text.lock().unwrap().clone();
-                    ui.label(
-                        egui::RichText::new(status)
-                            .small()
-                            .color(egui::Color32::GRAY),
-                    );
+            egui::TopBottomPanel::bottom("status_panel")
+                .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 8.0)))
+                .show_inside(ui, |ui| {
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        let status = app.status_text.lock().unwrap().clone();
+                        ui.label(
+                            egui::RichText::new(status)
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    });
                 });
-            });
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add_space(5.0);
+                        draw_connection(ui, app);
+                        ui.add_space(15.0);
+                        draw_devices(ui, app);
+                        ui.add_space(15.0);
+                        draw_controls(ui, app);
+                        ui.add_space(10.0);
+                    });
+                });
         });
 
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -122,6 +132,59 @@ pub fn render(ctx: &egui::Context, app: &mut P2PApp) {
                 }
             });
     }
+
+    if app.show_overlay && app.is_connected {
+        let peers = app.active_peers.lock().unwrap();
+        let now = Instant::now();
+
+        let mut speaking_peers = Vec::new();
+        for (_addr, state) in peers.iter() {
+            if now.duration_since(state.last_spoken).as_millis() < 300 {
+                speaking_peers.push(state.name.clone());
+            }
+        }
+
+        if !speaking_peers.is_empty() {
+            let overlay_builder = egui::ViewportBuilder::default()
+                .with_title("P2P Overlay")
+                .with_transparent(true)
+                .with_decorations(false)
+                .with_always_on_top()
+                .with_mouse_passthrough(true)
+                .with_inner_size([200.0, 300.0])
+                .with_position([20.0, 20.0]);
+
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("overlay_viewport"),
+                overlay_builder,
+                |overlay_ctx, _class| {
+                    let mut visuals = egui::Visuals::dark();
+                    visuals.panel_fill = egui::Color32::TRANSPARENT;
+                    overlay_ctx.set_visuals(visuals);
+
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
+                        .show(overlay_ctx, |ui| {
+                            for name in speaking_peers {
+                                egui::Frame::none()
+                                    .fill(egui::Color32::from_black_alpha(180))
+                                    .rounding(6.0)
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("🔊 {}", name))
+                                                .color(egui::Color32::GREEN)
+                                                .strong()
+                                                .size(16.0),
+                                        );
+                                    });
+                                ui.add_space(4.0);
+                            }
+                        });
+                },
+            );
+        }
+    }
 }
 
 fn draw_connection(ui: &mut egui::Ui, app: &mut P2PApp) {
@@ -179,6 +242,10 @@ fn draw_controls(ui: &mut egui::Ui, app: &mut P2PApp) {
     {
         app.is_deafened.store(deafened, Ordering::Relaxed);
     }
+
+    ui.add_space(5.0);
+
+    ui.checkbox(&mut app.show_overlay, "🔲 Игровой оверлей");
 
     ui.add_space(15.0);
 

@@ -23,6 +23,7 @@ pub struct P2PApp {
     pub update_info: Arc<Mutex<UpdateInfo>>,
     pub show_update_dialog: bool,
     pub is_updating: bool,
+    pub show_overlay: bool,
 }
 
 impl Default for P2PApp {
@@ -57,6 +58,7 @@ impl Default for P2PApp {
             update_info,
             show_update_dialog: false,
             is_updating: false,
+            show_overlay: false,
         }
     }
 }

@@ -115,3 +115,57 @@ jobs:
         with:
           name: p2p-voice-linux
           path: target/release/p2p-voice-linux
+
+  build-macos:
+      name: Build macOS Release
+      runs-on: macos-latest
+
+      env:
+        CMAKE_POLICY_VERSION_MINIMUM: 3.5
+
+      strategy:
+        matrix:
+          target: [aarch64-apple-darwin, x86_64-apple-darwin]
+
+      steps:
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Install Rust
+          uses: dtolnay/rust-toolchain@stable
+          with:
+            toolchain: stable
+            targets: ${{ matrix.target }}
+
+        - name: Rust Cache
+          uses: Swatinem/rust-cache@v2
+          with:
+            cache-targets: "release"
+            workspaces: "."
+            shared-key: "macos-release-${{ matrix.target }}"
+
+        - name: Build Release
+          run: cargo build --release --target ${{ matrix.target }}
+
+        - name: Get version from tag
+          id: get_version
+          shell: bash
+          run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+        - name: Rename binary for release
+          shell: bash
+          run: |
+            SUFFIX=$([[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]] && echo "arm64" || echo "x86_64")
+            mv target/${{ matrix.target }}/release/p2p-voice target/${{ matrix.target }}/release/p2p-voice-macos-$SUFFIX
+
+        - name: Create Release
+          uses: softprops/action-gh-release@v2
+          with:
+            name: Release ${{ steps.get_version.outputs.VERSION }}
+            draft: false
+            prerelease: false
+            files: |
+              target/${{ matrix.target }}/release/p2p-voice-macos-arm64
+              target/${{ matrix.target }}/release/p2p-voice-macos-x86_64
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -21,12 +21,18 @@ impl Default for UpdateInfo {
 }
 
 fn get_bin_name() -> String {
-    format!("p2p-voice{}", env::consts::EXE_SUFFIX)
+    format!("p2p-voice{}", std::env::consts::EXE_SUFFIX)
 }
 
 fn get_target_match() -> &'static str {
     if cfg!(target_os = "windows") {
         "windows"
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "macos-arm64"
+        } else {
+            "macos-x86_64"
+        }
     } else {
         "linux"
     }
