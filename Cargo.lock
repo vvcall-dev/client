@@ -2894,7 +2894,7 @@ dependencies = [
 
 [[package]]
 name = "p2p-voice"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "cpal",
