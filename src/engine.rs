@@ -19,6 +19,14 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
+struct PeerAudio {
+    decoder: Decoder,
+    jb_packets: std::collections::BTreeMap<u16, Vec<u8>>,
+    pcm_queue: VecDeque<f32>,
+    next_seq: Option<u16>,
+    buffering: bool,
+}
+
 pub fn start_voice_engine(
     username: String,
     room: String,
@@ -149,7 +157,7 @@ pub fn start_voice_engine(
 
         let resample_ratio = 48000.0 / hardware_sample_rate;
 
-        let peer_queues = Arc::new(Mutex::new(HashMap::<SocketAddr, VecDeque<f32>>::new()));
+        let peers_audio = Arc::new(Mutex::new(HashMap::<SocketAddr, PeerAudio>::new()));
         let source_idx_map = Arc::new(Mutex::new(HashMap::<SocketAddr, f32>::new()));
 
         socket
@@ -157,17 +165,17 @@ pub fn start_voice_engine(
             .unwrap();
 
         let kill_signal_rx = kill_signal.clone();
-        let queues_rx = peer_queues.clone();
         let active_peers_rx = active_peers.clone();
+        let peers_audio_rx = peers_audio.clone();
 
         std::thread::spawn(move || {
-            let mut decoders: HashMap<SocketAddr, Decoder> = HashMap::new();
             let mut buf = [0u8; 2048];
 
             while !kill_signal_rx.load(Ordering::Relaxed) {
                 match socket_receiver.recv_from(&mut buf) {
                     Ok((amt, src)) => {
                         let now = Instant::now();
+
                         if amt == 10 && &buf[..10] == b"HOLE_PUNCH" {
                             active_peers_rx
                                 .lock()
@@ -176,6 +184,7 @@ pub fn start_voice_engine(
                                 .and_modify(|s| s.last_seen = now);
                             continue;
                         }
+
                         if amt == 12 && &buf[..4] == b"PING" {
                             active_peers_rx
                                 .lock()
@@ -188,6 +197,7 @@ pub fn start_voice_engine(
                             let _ = socket_sender_pong.send_to(&pong, src);
                             continue;
                         }
+
                         if amt == 12 && &buf[..4] == b"PONG" {
                             let mut ts_bytes = [0u8; 8];
                             ts_bytes.copy_from_slice(&buf[4..12]);
@@ -199,25 +209,39 @@ pub fn start_voice_engine(
                             });
                             continue;
                         }
+
+                        if amt < 2 || amt == 4 || amt == 10 || amt == 12 {
+                            continue;
+                        }
+
                         active_peers_rx.lock().unwrap().entry(src).and_modify(|s| {
                             s.last_seen = now;
                             s.last_spoken = now;
                         });
-                        let decoder = decoders
-                            .entry(src)
-                            .or_insert_with(|| Decoder::new(48000, Channels::Mono).unwrap());
-                        let mut decoded = vec![0f32; 960];
-                        if let Ok(count) = decoder.decode_float(&buf[..amt], &mut decoded, false) {
-                            let mut q_map = queues_rx.lock().unwrap();
-                            let q = q_map
-                                .entry(src)
-                                .or_insert_with(|| VecDeque::with_capacity(9600));
-                            for i in 0..count {
-                                q.push_back(decoded[i]);
+
+                        let seq = u16::from_be_bytes([buf[0], buf[1]]);
+                        let payload = buf[2..amt].to_vec();
+
+                        let mut pa_map = peers_audio_rx.lock().unwrap();
+                        let pa = pa_map.entry(src).or_insert_with(|| PeerAudio {
+                            decoder: Decoder::new(48000, Channels::Mono).unwrap(),
+                            jb_packets: std::collections::BTreeMap::new(),
+                            pcm_queue: VecDeque::with_capacity(2000),
+                            next_seq: None,
+                            buffering: true,
+                        });
+
+                        if let Some(expected) = pa.next_seq {
+                            if (seq.wrapping_sub(expected) as i16) < 0 {
+                                continue;
                             }
-                            if q.len() > 4800 {
-                                q.drain(0..960);
-                            }
+                        }
+
+                        pa.jb_packets.insert(seq, payload);
+
+                        if pa.jb_packets.len() > 10 {
+                            let first_key = *pa.jb_packets.keys().next().unwrap();
+                            pa.jb_packets.remove(&first_key);
                         }
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(10)),
@@ -260,53 +284,94 @@ pub fn start_voice_engine(
             }
         };
 
-        let queues_tx = peer_queues.clone();
+        let peers_audio_tx = peers_audio.clone();
         let source_idx_tx = source_idx_map.clone();
         let active_peers_out = active_peers.clone();
         let is_deafened_out = is_deafened.clone();
 
         let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             if is_deafened_out.load(Ordering::Relaxed) {
-                for q in queues_tx.lock().unwrap().values_mut() {
-                    q.clear();
-                }
                 for ch in data.iter_mut() {
                     *ch = 0.0;
                 }
                 return;
             }
-            let volumes: HashMap<SocketAddr, f32> = {
-                active_peers_out
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (*k, v.volume))
-                    .collect()
-            };
-            let mut queues = queues_tx.lock().unwrap();
+
+            let volumes: HashMap<SocketAddr, f32> = active_peers_out
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (*k, v.volume))
+                .collect();
+
+            let mut audio_states = peers_audio_tx.lock().unwrap();
             let mut indices = source_idx_tx.lock().unwrap();
+
+            for (_addr, pa) in audio_states.iter_mut() {
+                while pa.pcm_queue.len() < 960 {
+                    if pa.buffering {
+                        if pa.jb_packets.len() >= 2 {
+                            pa.buffering = false;
+                            pa.next_seq = Some(*pa.jb_packets.keys().next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if !pa.buffering {
+                        let expected = pa.next_seq.unwrap();
+                        let mut decoded = vec![0f32; 960];
+
+                        if let Some(packet) = pa.jb_packets.remove(&expected) {
+                            if let Ok(count) = pa.decoder.decode_float(&packet, &mut decoded, false)
+                            {
+                                pa.pcm_queue.extend(&decoded[..count]);
+                            }
+                            pa.next_seq = Some(expected.wrapping_add(1));
+                        } else {
+                            if pa.jb_packets.is_empty() {
+                                pa.buffering = true;
+                                break;
+                            } else {
+                                if let Ok(count) = pa.decoder.decode_float(&[], &mut decoded, false)
+                                {
+                                    pa.pcm_queue.extend(&decoded[..count]);
+                                }
+                                pa.next_seq = Some(expected.wrapping_add(1));
+                            }
+                        }
+                    }
+                }
+            }
+
             for frame in data.chunks_mut(hardware_channels) {
                 let mut mixed = 0.0_f32;
-                for (addr, queue) in queues.iter_mut() {
+
+                for (addr, pa) in audio_states.iter_mut() {
                     let vol = volumes.get(addr).unwrap_or(&1.0);
                     let idx_ref = indices.entry(*addr).or_insert(0.0);
                     let i = *idx_ref as usize;
+
                     let mut sample = 0.0_f32;
-                    if queue.len() > i + 1 {
-                        sample = queue[i] + (*idx_ref - i as f32) * (queue[i + 1] - queue[i]);
-                    } else if let Some(&s) = queue.get(i) {
+                    if pa.pcm_queue.len() > i + 1 {
+                        sample = pa.pcm_queue[i]
+                            + (*idx_ref - i as f32) * (pa.pcm_queue[i + 1] - pa.pcm_queue[i]);
+                    } else if let Some(&s) = pa.pcm_queue.get(i) {
                         sample = s;
                     }
+
                     mixed += sample * vol;
+
                     *idx_ref += resample_ratio;
                     if *idx_ref >= 1.0 {
                         let advance = idx_ref.floor() as usize;
                         for _ in 0..advance {
-                            queue.pop_front();
+                            pa.pcm_queue.pop_front();
                         }
                         *idx_ref -= advance as f32;
                     }
                 }
+
                 mixed = mixed.clamp(-1.0, 1.0);
                 for ch in frame.iter_mut() {
                     *ch = mixed;
@@ -351,7 +416,7 @@ pub fn start_voice_engine(
             let mut peers = active_peers.lock().unwrap();
             peers.retain(|addr, state| {
                 if now.duration_since(state.last_seen).as_secs() > 5 {
-                    peer_queues.lock().unwrap().remove(addr);
+                    peers_audio.lock().unwrap().remove(addr);
                     source_idx_map.lock().unwrap().remove(addr);
                     false
                 } else {

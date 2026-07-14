@@ -55,29 +55,55 @@ jobs:
   build-linux:
     name: Build Linux Release
     runs-on: ubuntu-latest
+
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: 3.5
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            pkg-config \
+            cmake \
+            build-essential \
+            libssl-dev
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "release"
+          workspaces: "."
+          shared-key: "linux-release"
+
       - name: Build
         run: cargo build --release
+
+      - name: Get version from tag
+        id: get_version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Upload Linux Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ steps.get_version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          files: target/release/p2p-voice
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: p2p-voice-linux
           path: target/release/p2p-voice
-
-  # build-macos:
-  #   name: Build macOS Release
-  #   runs-on: macos-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@stable
-  #     - name: Build
-  #       run: cargo build --release
-  #     - name: Upload artifact
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: p2p-voice-macos
-  #         path: target/release/p2p-voice
