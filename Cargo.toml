@@ -1,6 +1,6 @@
 [package]
 name = "p2p-voice"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
@@ -16,6 +16,10 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 semver = "1.0"
 ureq = { version = "2.9", features = ["json", "tls"] }
 serde_json = "1.0"
+aes-gcm = "0.10.3"
+sha2 = "0.10.8"
+rand = "0.8.5"
+hex = "0.4.3"
 
 [profile.release]
 opt-level = 3
