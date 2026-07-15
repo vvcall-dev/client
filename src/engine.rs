@@ -44,6 +44,7 @@ impl Default for PeerAudio {
 }
 
 pub fn start_voice_engine(
+    server_url: String,
     username: String,
     room: String,
     selected_input_name: String,
@@ -75,7 +76,13 @@ pub fn start_voice_engine(
 
         *status.lock().unwrap() = "В комнате".to_string();
 
-        let ws_url = format!("wss://p2p.tallfly.me/ws/{}", room);
+        let scheme = if server_url.contains("localhost") || server_url.contains("127.0.0.1") {
+            "ws"
+        } else {
+            "wss"
+        };
+
+        let ws_url = format!("{}://{}/ws/{}", scheme, server_url, room);
         let (mut ws_socket, _) = match connect(&ws_url) {
             Ok(s) => s,
             Err(e) => {

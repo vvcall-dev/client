@@ -7,7 +7,8 @@ edition = "2024"
 cpal = "0.15.2"
 opus = "0.3.0"
 anyhow = "1.0"
-eframe = "0.27"
+eframe = { version = "0.27", features = ["persistence", "glow"] }
+serde = { version = "1.0", features = ["derive"] }
 tungstenite = { version = "0.21.0", features = ["rustls-tls-webpki-roots"] }
 url = "2.5.0"
 self_update = { version = "0.42", features = ["archive-zip"] }

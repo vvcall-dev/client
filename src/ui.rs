@@ -133,7 +133,7 @@ pub fn render(ctx: &egui::Context, app: &mut P2PApp) {
             });
     }
 
-    if app.show_overlay && app.is_connected {
+    if app.config.show_overlay && app.is_connected {
         let peers = app.active_peers.lock().unwrap();
         let now = Instant::now();
 
@@ -188,8 +188,13 @@ pub fn render(ctx: &egui::Context, app: &mut P2PApp) {
 }
 
 fn draw_connection(ui: &mut egui::Ui, app: &mut P2PApp) {
-    ui.label("👤 Ваш Ник:");
-    ui.add(egui::TextEdit::singleline(&mut app.username).desired_width(f32::INFINITY));
+    ui.label("🌐 Сервер (URL):");
+    ui.add(egui::TextEdit::singleline(&mut app.config.server_url).desired_width(f32::INFINITY));
+
+    ui.add_space(5.0);
+
+    ui.label("👤 Никнейм:");
+    ui.add(egui::TextEdit::singleline(&mut app.config.username).desired_width(f32::INFINITY));
 
     ui.add_space(5.0);
 
@@ -200,11 +205,11 @@ fn draw_connection(ui: &mut egui::Ui, app: &mut P2PApp) {
 fn draw_devices(ui: &mut egui::Ui, app: &mut P2PApp) {
     ui.label("🎤 Микрофон:");
     egui::ComboBox::from_id_source("mic")
-        .selected_text(&app.selected_input)
+        .selected_text(&app.config.selected_input)
         .width(ui.available_width())
         .show_ui(ui, |ui| {
             for dev in &app.available_inputs {
-                ui.selectable_value(&mut app.selected_input, dev.clone(), dev);
+                ui.selectable_value(&mut app.config.selected_input, dev.clone(), dev);
             }
         });
 
@@ -212,11 +217,11 @@ fn draw_devices(ui: &mut egui::Ui, app: &mut P2PApp) {
 
     ui.label("🎧 Динамики:");
     egui::ComboBox::from_id_source("out")
-        .selected_text(&app.selected_output)
+        .selected_text(&app.config.selected_output)
         .width(ui.available_width())
         .show_ui(ui, |ui| {
             for dev in &app.available_outputs {
-                ui.selectable_value(&mut app.selected_output, dev.clone(), dev);
+                ui.selectable_value(&mut app.config.selected_output, dev.clone(), dev);
             }
         });
 
@@ -245,7 +250,7 @@ fn draw_controls(ui: &mut egui::Ui, app: &mut P2PApp) {
 
     ui.add_space(5.0);
 
-    ui.checkbox(&mut app.show_overlay, "🔲 Игровой оверлей");
+    ui.checkbox(&mut app.config.show_overlay, "🔲 Игровой оверлей");
 
     ui.add_space(15.0);
 
@@ -277,10 +282,11 @@ fn draw_controls(ui: &mut egui::Ui, app: &mut P2PApp) {
             app.kill_signal.store(false, Ordering::Relaxed);
             *app.status_text.lock().unwrap() = "Инициализация...".to_string();
             engine::start_voice_engine(
-                app.username.clone(),
+                app.config.server_url.clone(),
+                app.config.username.clone(),
                 app.room_name.clone(),
-                app.selected_input.clone(),
-                app.selected_output.clone(),
+                app.config.selected_input.clone(),
+                app.config.selected_output.clone(),
                 app.volume_level.clone(),
                 app.status_text.clone(),
                 app.kill_signal.clone(),
