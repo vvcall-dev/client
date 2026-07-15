@@ -60,6 +60,7 @@ pub struct P2PApp {
     pub auth_rx: Option<Receiver<AuthResponse>>,
 
     pub room_name: String,
+    pub room_password: String,
     pub is_connected: bool,
     pub volume_level: Arc<Mutex<f32>>,
     pub status_text: Arc<Mutex<String>>,
@@ -116,6 +117,7 @@ impl P2PApp {
             auth_rx: None,
 
             room_name: "default".to_owned(),
+            room_password: "".to_owned(),
             is_connected: false,
             volume_level: Arc::new(Mutex::new(0.0)),
             status_text: Arc::new(Mutex::new("Ожидание...".to_string())),

@@ -1,8 +1,14 @@
 use crate::audio;
 use crate::models::PeerState;
 use crate::network;
+use aes_gcm::{
+    Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit},
+};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use opus::{Application, Channels, Decoder, Encoder};
+use rand::Rng;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
@@ -47,6 +53,7 @@ pub fn start_voice_engine(
     server_url: String,
     username: String,
     room: String,
+    room_password: String,
     selected_input_name: String,
     selected_output_name: String,
     volume_level_ref: Arc<Mutex<f32>>,
@@ -58,6 +65,16 @@ pub fn start_voice_engine(
 ) {
     std::thread::spawn(move || {
         let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+
+        let mut room_hasher = Sha256::new();
+        room_hasher.update(format!("{}:{}", room, room_password).as_bytes());
+        let secure_room_hash = hex::encode(room_hasher.finalize());
+
+        let mut key_hasher = Sha256::new();
+        key_hasher.update(room_password.as_bytes());
+        key_hasher.update(b"tallfly_p2p_salt");
+        let aes_key_bytes = key_hasher.finalize();
+        let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes).clone();
 
         *status.lock().unwrap() = "Получаю IP (STUN)...".to_string();
         let my_public_addr = match network::get_public_ip(&socket) {
@@ -82,7 +99,7 @@ pub fn start_voice_engine(
             "wss"
         };
 
-        let ws_url = format!("{}://{}/ws/{}", scheme, server_url, room);
+        let ws_url = format!("{}://{}/ws/{}", scheme, server_url, secure_room_hash);
         let (mut ws_socket, _) = match connect(&ws_url) {
             Ok(s) => s,
             Err(e) => {
@@ -190,6 +207,7 @@ pub fn start_voice_engine(
         let peers_audio_rx = peers_audio.clone();
 
         std::thread::spawn(move || {
+            let cipher = Aes256Gcm::new(&aes_key);
             let mut buf = [0u8; 2048];
 
             while !kill_signal_rx.load(Ordering::Relaxed) {
@@ -231,17 +249,25 @@ pub fn start_voice_engine(
                             continue;
                         }
 
-                        if amt < 2 || amt == 4 || amt == 10 || amt == 12 {
+                        if amt < 30 {
                             continue;
                         }
 
-                        active_peers_rx.lock().unwrap().entry(src).and_modify(|s| {
-                            s.last_seen = now;
-                            s.last_spoken = now;
-                        });
-
                         let seq = u16::from_be_bytes([buf[0], buf[1]]);
-                        let payload = buf[2..amt].to_vec();
+                        let nonce = Nonce::from_slice(&buf[2..14]);
+                        let ciphertext = &buf[14..amt];
+
+                        let payload = match cipher.decrypt(nonce, ciphertext) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                continue;
+                            }
+                        };
+
+                        active_peers_rx.lock().unwrap().entry(src).and_modify(|s| {
+                            s.last_seen = Instant::now();
+                            s.last_spoken = Instant::now();
+                        });
 
                         let mut pa_map = peers_audio_rx.lock().unwrap();
                         let pa = pa_map.entry(src).or_insert_with(PeerAudio::default);
@@ -259,11 +285,12 @@ pub fn start_voice_engine(
                             pa.jb_packets.remove(&first_key);
                         }
                     }
-                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
                 }
             }
         });
 
+        let cipher_tx = Aes256Gcm::new(&aes_key);
         let mut encoder = Encoder::new(48000, Channels::Mono, Application::Voip).unwrap();
         let mut input_buffer = Vec::new();
         let active_peers_tx = active_peers.clone();
@@ -302,16 +329,26 @@ pub fn start_voice_engine(
                     chunk.copy_from_slice(&input_buffer[0..960]);
                     input_buffer.drain(0..960);
 
-                    let mut out_bytes = [0u8; 1022];
-                    out_bytes[0..2].copy_from_slice(&seq_num.to_be_bytes());
+                    let mut opus_buf = [0u8; 1000];
+                    if let Ok(size) = encoder.encode_float(&chunk, &mut opus_buf) {
+                        let opus_payload = &opus_buf[..size];
 
-                    if let Ok(size) = encoder.encode_float(&chunk, &mut out_bytes[2..]) {
-                        let packet_size = size + 2;
-                        let peers = active_peers_tx.lock().unwrap();
-                        for (peer, _) in peers.iter() {
-                            let _ = socket_sender.send_to(&out_bytes[..packet_size], peer);
+                        let mut nonce_bytes = [0u8; 12];
+                        rand::thread_rng().fill(&mut nonce_bytes);
+                        let nonce = Nonce::from_slice(&nonce_bytes);
+
+                        if let Ok(ciphertext) = cipher_tx.encrypt(nonce, opus_payload) {
+                            let mut final_packet = Vec::with_capacity(2 + 12 + ciphertext.len());
+                            final_packet.extend_from_slice(&seq_num.to_be_bytes());
+                            final_packet.extend_from_slice(&nonce_bytes);
+                            final_packet.extend_from_slice(&ciphertext);
+
+                            let peers = active_peers_tx.lock().unwrap();
+                            for (peer, _) in peers.iter() {
+                                let _ = socket_sender.send_to(&final_packet, peer);
+                            }
+                            seq_num = seq_num.wrapping_add(1);
                         }
-                        seq_num = seq_num.wrapping_add(1);
                     }
                 }
             } else {

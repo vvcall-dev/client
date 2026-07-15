@@ -357,6 +357,15 @@ fn draw_connection(ui: &mut egui::Ui, app: &mut P2PApp) {
 
     ui.label("🚪 Название комнаты:");
     ui.add(egui::TextEdit::singleline(&mut app.room_name).desired_width(f32::INFINITY));
+
+    ui.add_space(5.0);
+
+    ui.label("🔑 Пароль комнаты:");
+    ui.add(
+        egui::TextEdit::singleline(&mut app.room_password)
+            .password(true)
+            .desired_width(f32::INFINITY),
+    );
 }
 
 fn draw_devices(ui: &mut egui::Ui, app: &mut P2PApp) {
@@ -442,6 +451,7 @@ fn draw_controls(ui: &mut egui::Ui, app: &mut P2PApp) {
                 app.config.server_url.clone(),
                 app.config.username.clone(),
                 app.room_name.clone(),
+                app.room_password.clone(),
                 app.config.selected_input.clone(),
                 app.config.selected_output.clone(),
                 app.volume_level.clone(),
