@@ -1,4 +1,4 @@
-use crate::app::P2PApp;
+use crate::app::{AppScreen, AuthResponse, P2PApp};
 use crate::audio;
 use crate::engine;
 use eframe::egui;
@@ -6,54 +6,11 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 pub fn render(ctx: &egui::Context, app: &mut P2PApp) {
-    egui::SidePanel::left("controls")
-        .exact_width(280.0)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.add_space(11.0);
-            ui.heading(egui::RichText::new("⚙ Настройки").strong());
-            ui.add_space(5.0);
-            ui.separator();
-            ui.add_space(5.0);
-
-            egui::TopBottomPanel::bottom("status_panel")
-                .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 8.0)))
-                .show_inside(ui, |ui| {
-                    ui.add_space(8.0);
-                    ui.vertical_centered(|ui| {
-                        let status = app.status_text.lock().unwrap().clone();
-                        ui.label(
-                            egui::RichText::new(status)
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                    });
-                });
-
-            egui::CentralPanel::default()
-                .frame(egui::Frame::none())
-                .show_inside(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.add_space(5.0);
-                        draw_connection(ui, app);
-                        ui.add_space(15.0);
-                        draw_devices(ui, app);
-                        ui.add_space(15.0);
-                        draw_controls(ui, app);
-                        ui.add_space(10.0);
-                    });
-                });
-        });
-
-    egui::CentralPanel::default().show(ctx, |ui| {
-        ui.add_space(5.0);
-        ui.heading(egui::RichText::new("👥 Участники").strong());
-        ui.add_space(5.0);
-        ui.separator();
-        ui.add_space(5.0);
-
-        draw_peers(ui, app);
-    });
+    match app.current_screen {
+        AppScreen::Login => draw_auth_screen(ctx, app, true),
+        AppScreen::Register => draw_auth_screen(ctx, app, false),
+        AppScreen::Main => draw_main_screen(ctx, app),
+    }
 
     if app.show_update_dialog {
         let screen_rect = ctx.screen_rect();
@@ -131,20 +88,8 @@ pub fn render(ctx: &egui::Context, app: &mut P2PApp) {
                     });
                 }
             });
-    }
 
-    if app.config.show_overlay && app.is_connected {
-        let peers = app.active_peers.lock().unwrap();
-        let now = Instant::now();
-
-        let mut speaking_peers = Vec::new();
-        for (_addr, state) in peers.iter() {
-            if now.duration_since(state.last_spoken).as_millis() < 300 {
-                speaking_peers.push(state.name.clone());
-            }
-        }
-
-        if !speaking_peers.is_empty() {
+        if app.config.show_overlay && app.is_connected {
             let overlay_builder = egui::ViewportBuilder::default()
                 .with_title("P2P Overlay")
                 .with_transparent(true)
@@ -158,27 +103,31 @@ pub fn render(ctx: &egui::Context, app: &mut P2PApp) {
                 egui::ViewportId::from_hash_of("overlay_viewport"),
                 overlay_builder,
                 |overlay_ctx, _class| {
-                    let mut visuals = egui::Visuals::dark();
-                    visuals.panel_fill = egui::Color32::TRANSPARENT;
-                    overlay_ctx.set_visuals(visuals);
-
                     egui::CentralPanel::default()
                         .frame(egui::Frame::none().fill(egui::Color32::TRANSPARENT))
                         .show(overlay_ctx, |ui| {
-                            for name in speaking_peers {
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_black_alpha(180))
-                                    .rounding(6.0)
-                                    .inner_margin(6.0)
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!("🔊 {}", name))
-                                                .color(egui::Color32::GREEN)
-                                                .strong()
-                                                .size(16.0),
-                                        );
-                                    });
-                                ui.add_space(4.0);
+                            let peers = app.active_peers.lock().unwrap();
+                            let now = Instant::now();
+
+                            for (_addr, state) in peers.iter() {
+                                let is_speaking =
+                                    now.duration_since(state.last_spoken).as_millis() < 300;
+
+                                if is_speaking {
+                                    egui::Frame::none()
+                                        .fill(egui::Color32::from_black_alpha(180))
+                                        .rounding(6.0)
+                                        .inner_margin(6.0)
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("🔊 {}", state.name))
+                                                    .color(egui::Color32::GREEN)
+                                                    .strong()
+                                                    .size(16.0),
+                                            );
+                                        });
+                                    ui.add_space(4.0);
+                                }
                             }
                         });
                 },
@@ -187,8 +136,216 @@ pub fn render(ctx: &egui::Context, app: &mut P2PApp) {
     }
 }
 
+fn draw_main_screen(ctx: &egui::Context, app: &mut P2PApp) {
+    egui::SidePanel::left("controls")
+        .exact_width(280.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.add_space(11.0);
+            ui.heading(egui::RichText::new("⚙ Настройки").strong());
+            ui.add_space(5.0);
+            ui.separator();
+            ui.add_space(5.0);
+
+            egui::TopBottomPanel::bottom("status_panel")
+                .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 8.0)))
+                .show_inside(ui, |ui| {
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        let status = app.status_text.lock().unwrap().clone();
+                        ui.label(
+                            egui::RichText::new(status)
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    });
+                });
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.add_space(5.0);
+                        draw_connection(ui, app);
+                        ui.add_space(15.0);
+                        draw_devices(ui, app);
+                        ui.add_space(15.0);
+                        draw_controls(ui, app);
+                        ui.add_space(10.0);
+                        if ui.button("🚪 Выйти из аккаунта").clicked() {
+                            app.config.auth_token.clear();
+                            app.current_screen = AppScreen::Login;
+                        }
+                    });
+                });
+        });
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.add_space(5.0);
+        ui.heading(egui::RichText::new("👥 Участники").strong());
+        ui.add_space(5.0);
+        ui.separator();
+        ui.add_space(5.0);
+
+        draw_peers(ui, app);
+    });
+}
+
+fn draw_auth_screen(ctx: &egui::Context, app: &mut P2PApp, is_login: bool) {
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(20.0);
+            let title = if is_login {
+                "Вход в аккаунт"
+            } else {
+                "Регистрация"
+            };
+            ui.label(egui::RichText::new(title).size(20.0));
+            ui.add_space(15.0);
+
+            ui.horizontal(|ui| {
+                ui.add_space(ui.available_width() / 2.0 - 125.0);
+                ui.vertical(|ui| {
+                    ui.label("Сервер:");
+                    ui.add_sized(
+                        [250.0, 20.0],
+                        egui::TextEdit::singleline(&mut app.config.server_url),
+                    );
+
+                    ui.add_space(10.0);
+                    ui.label("Логин:");
+                    ui.add_sized(
+                        [250.0, 20.0],
+                        egui::TextEdit::singleline(&mut app.config.username),
+                    );
+
+                    ui.add_space(10.0);
+                    ui.label("Пароль:");
+                    ui.add_sized(
+                        [250.0, 20.0],
+                        egui::TextEdit::singleline(&mut app.password_input).password(true),
+                    );
+                });
+            });
+
+            ui.add_space(20.0);
+
+            if app.is_authenticating {
+                ui.spinner();
+            } else {
+                let btn_text = if is_login {
+                    "Войти"
+                } else {
+                    "Зарегистрироваться"
+                };
+                if ui
+                    .add_sized([250.0, 35.0], egui::Button::new(btn_text))
+                    .clicked()
+                {
+                    app.is_authenticating = true;
+                    app.auth_message.clear();
+
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    app.auth_rx = Some(rx);
+                    spawn_auth_request(
+                        is_login,
+                        app.config.server_url.clone(),
+                        app.config.username.clone(),
+                        app.password_input.clone(),
+                        tx,
+                    );
+                }
+            }
+
+            ui.add_space(10.0);
+
+            if !app.auth_message.is_empty() {
+                let color = if app.auth_message.contains("успешна") {
+                    egui::Color32::GREEN
+                } else {
+                    egui::Color32::RED
+                };
+                ui.label(egui::RichText::new(&app.auth_message).color(color));
+            }
+
+            ui.add_space(20.0);
+
+            if is_login {
+                if ui.link("Нет аккаунта? Зарегистрироваться").clicked()
+                {
+                    app.current_screen = AppScreen::Register;
+                    app.auth_message.clear();
+                }
+            } else {
+                if ui.link("Уже есть аккаунт? Войти").clicked() {
+                    app.current_screen = AppScreen::Login;
+                    app.auth_message.clear();
+                }
+            }
+        });
+    });
+}
+
+fn spawn_auth_request(
+    is_login: bool,
+    server: String,
+    user: String,
+    pass: String,
+    tx: std::sync::mpsc::Sender<AuthResponse>,
+) {
+    std::thread::spawn(move || {
+        let scheme = if server.contains("localhost") || server.contains("127.0.0.1") {
+            "http"
+        } else {
+            "https"
+        };
+        let endpoint = if is_login { "login" } else { "register" };
+        let url = format!("{}://{}/api/{}", scheme, server, endpoint);
+
+        let body = serde_json::json!({
+            "username": user,
+            "password": pass
+        });
+
+        match ureq::post(&url).send_json(body) {
+            Ok(response) => {
+                if let Ok(auth_res) = response.into_json::<AuthResponse>() {
+                    let _ = tx.send(auth_res);
+                } else {
+                    let _ = tx.send(AuthResponse {
+                        success: false,
+                        message: "Ошибка обработки ответа".into(),
+                        token: None,
+                        config_json: None,
+                    });
+                }
+            }
+            Err(ureq::Error::Status(400..=599, response)) => {
+                if let Ok(auth_res) = response.into_json::<AuthResponse>() {
+                    let _ = tx.send(auth_res);
+                } else {
+                    let _ = tx.send(AuthResponse {
+                        success: false,
+                        message: "Ошибка на сервере".into(),
+                        token: None,
+                        config_json: None,
+                    });
+                }
+            }
+            Err(_) => {
+                let _ = tx.send(AuthResponse {
+                    success: false,
+                    message: "Сервер недоступен".into(),
+                    token: None,
+                    config_json: None,
+                });
+            }
+        }
+    });
+}
+
 fn draw_connection(ui: &mut egui::Ui, app: &mut P2PApp) {
-    ui.label("🌐 Сервер (URL):");
+    ui.label("🌐 Сервер:");
     ui.add(egui::TextEdit::singleline(&mut app.config.server_url).desired_width(f32::INFINITY));
 
     ui.add_space(5.0);

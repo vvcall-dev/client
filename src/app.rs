@@ -5,7 +5,26 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{
+    Arc, Mutex,
+    atomic::AtomicBool,
+    mpsc::{self, Receiver, Sender},
+};
+
+#[derive(PartialEq)]
+pub enum AppScreen {
+    Login,
+    Register,
+    Main,
+}
+
+#[derive(Deserialize)]
+pub struct AuthResponse {
+    pub success: bool,
+    pub message: String,
+    pub token: Option<String>,
+    pub config_json: Option<String>,
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
@@ -22,7 +41,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             server_url: "p2p.tallfly.me".to_string(),
-            username: "defaultuser67".to_string(),
+            username: "".to_string(),
             auth_token: "".to_string(),
             selected_input: "".to_string(),
             selected_output: "".to_string(),
@@ -33,6 +52,12 @@ impl Default for AppConfig {
 
 pub struct P2PApp {
     pub config: AppConfig,
+
+    pub current_screen: AppScreen,
+    pub password_input: String,
+    pub auth_message: String,
+    pub is_authenticating: bool,
+    pub auth_rx: Option<Receiver<AuthResponse>>,
 
     pub room_name: String,
     pub is_connected: bool,
@@ -58,6 +83,12 @@ impl P2PApp {
             }
         }
 
+        let initial_screen = if config.auth_token.is_empty() {
+            AppScreen::Login
+        } else {
+            AppScreen::Main
+        };
+
         let update_info = Arc::new(Mutex::new(UpdateInfo::default()));
         check_for_updates(update_info.clone());
 
@@ -78,6 +109,12 @@ impl P2PApp {
 
         Self {
             config,
+            current_screen: initial_screen,
+            password_input: String::new(),
+            auth_message: String::new(),
+            is_authenticating: false,
+            auth_rx: None,
+
             room_name: "default".to_owned(),
             is_connected: false,
             volume_level: Arc::new(Mutex::new(0.0)),
@@ -101,6 +138,25 @@ impl eframe::App for P2PApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(rx) = &self.auth_rx {
+            if let Ok(response) = rx.try_recv() {
+                self.is_authenticating = false;
+                if response.success {
+                    if let Some(token) = response.token {
+                        self.config.auth_token = token;
+                        self.current_screen = AppScreen::Main;
+                        self.password_input.clear();
+                        self.auth_message.clear();
+                    } else {
+                        self.auth_message = "Регистрация успешна! Теперь войдите.".into();
+                        self.current_screen = AppScreen::Login;
+                    }
+                } else {
+                    self.auth_message = response.message;
+                }
+            }
+        }
+
         if !self.show_update_dialog {
             let info = self.update_info.lock().unwrap();
             if let Some(latest) = &info.latest_version {
