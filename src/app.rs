@@ -5,11 +5,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{
-    Arc, Mutex,
-    atomic::AtomicBool,
-    mpsc::{self, Receiver, Sender},
-};
+use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc::Receiver};
 
 #[derive(PartialEq)]
 pub enum AppScreen {

@@ -10,7 +10,7 @@ use opus::{Application, Channels, Decoder, Encoder};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -76,6 +76,16 @@ pub fn start_voice_engine(
         let aes_key_bytes = key_hasher.finalize();
         let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes).clone();
 
+        let my_peer_id: u32 = rand::random();
+
+        let host = server_url.split(':').next().unwrap_or(&server_url);
+        let relay_addr_str = format!("{}:3031", host);
+        let relay_addr: SocketAddr = relay_addr_str
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut iter| iter.next())
+            .unwrap_or_else(|| "127.0.0.1:3031".parse().unwrap());
+
         *status.lock().unwrap() = "Получаю IP (STUN)...".to_string();
         let my_public_addr = match network::get_public_ip(&socket) {
             Some(addr) => addr,
@@ -91,6 +101,9 @@ pub fn start_voice_engine(
         let socket_sender_pong = socket.try_clone().expect("Не удалось клонировать сокет");
         let socket_sender_ping = socket.try_clone().expect("Не удалось клонировать сокет");
 
+        let peer_id_map = Arc::new(Mutex::new(HashMap::<u32, SocketAddr>::new()));
+        let direct_rx_map = Arc::new(Mutex::new(HashMap::<SocketAddr, Instant>::new()));
+
         *status.lock().unwrap() = "В комнате".to_string();
 
         let scheme = if server_url.contains("localhost") || server_url.contains("127.0.0.1") {
@@ -98,8 +111,8 @@ pub fn start_voice_engine(
         } else {
             "wss"
         };
-
         let ws_url = format!("{}://{}/ws/{}", scheme, server_url, secure_room_hash);
+
         let (mut ws_socket, _) = match connect(&ws_url) {
             Ok(s) => s,
             Err(e) => {
@@ -108,10 +121,11 @@ pub fn start_voice_engine(
             }
         };
 
-        let my_info = format!("{}|{}", my_public_addr, username);
+        let my_info = format!("{}|{}|{}", my_public_addr, username, my_peer_id);
         ws_socket.send(Message::Text(my_info.clone())).unwrap();
 
         let peers_ws = active_peers.clone();
+        let peer_id_map_ws = peer_id_map.clone();
         let socket_puncher = socket.try_clone().unwrap();
         let my_info_clone = my_info.clone();
         let kill_signal_ws = kill_signal.clone();
@@ -121,8 +135,15 @@ pub fn start_voice_engine(
                 match ws_socket.read() {
                     Ok(Message::Text(text)) => {
                         if text != my_info_clone {
-                            if let Some((ip_str, name)) = text.split_once('|') {
-                                if let Ok(peer_addr) = ip_str.parse::<SocketAddr>() {
+                            let parts: Vec<&str> = text.split('|').collect();
+                            if parts.len() == 3 {
+                                if let (Ok(peer_addr), Ok(peer_id)) =
+                                    (parts[0].parse::<SocketAddr>(), parts[2].parse::<u32>())
+                                {
+                                    let name = parts[1];
+
+                                    peer_id_map_ws.lock().unwrap().insert(peer_id, peer_addr);
+
                                     let mut p = peers_ws.lock().unwrap();
                                     if !p.contains_key(&peer_addr) {
                                         p.insert(
@@ -155,7 +176,6 @@ pub fn start_voice_engine(
         });
 
         let host = cpal::default_host();
-
         let input_device = match audio::find_device_by_name(&host, &selected_input_name, true) {
             Some(d) => d,
             None => {
@@ -163,7 +183,6 @@ pub fn start_voice_engine(
                 return;
             }
         };
-
         let output_device = match audio::find_device_by_name(&host, &selected_output_name, false) {
             Some(d) => d,
             None => {
@@ -172,21 +191,8 @@ pub fn start_voice_engine(
             }
         };
 
-        let input_config = match input_device.default_input_config() {
-            Ok(c) => c,
-            Err(e) => {
-                *status.lock().unwrap() = format!("Ошибка конфига микрофона: {}", e);
-                return;
-            }
-        };
-
-        let output_config = match output_device.default_output_config() {
-            Ok(c) => c,
-            Err(e) => {
-                *status.lock().unwrap() = format!("Ошибка конфига динамиков: {}", e);
-                return;
-            }
-        };
+        let input_config = input_device.default_input_config().unwrap();
+        let output_config = output_device.default_output_config().unwrap();
 
         let input_channels = input_config.channels() as usize;
         let input_stream_config = input_config.config();
@@ -206,14 +212,43 @@ pub fn start_voice_engine(
         let active_peers_rx = active_peers.clone();
         let peers_audio_rx = peers_audio.clone();
 
+        let direct_rx_map_rx = direct_rx_map.clone();
+        let peer_id_map_rx = peer_id_map.clone();
+        let secure_room_hash_rx = secure_room_hash.clone();
+
         std::thread::spawn(move || {
             let cipher = Aes256Gcm::new(&aes_key);
             let mut buf = [0u8; 2048];
 
             while !kill_signal_rx.load(Ordering::Relaxed) {
                 match socket_receiver.recv_from(&mut buf) {
-                    Ok((amt, src)) => {
+                    Ok((mut amt, mut src)) => {
                         let now = Instant::now();
+
+                        if src == relay_addr {
+                            if amt > 68 {
+                                let hash_str = String::from_utf8_lossy(&buf[..64]);
+                                if hash_str == secure_room_hash_rx {
+                                    let peer_id =
+                                        u32::from_be_bytes([buf[64], buf[65], buf[66], buf[67]]);
+                                    if let Some(&addr) =
+                                        peer_id_map_rx.lock().unwrap().get(&peer_id)
+                                    {
+                                        src = addr;
+                                        buf.copy_within(68..amt, 0);
+                                        amt -= 68;
+                                    } else {
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            direct_rx_map_rx.lock().unwrap().insert(src, now);
+                        }
 
                         if amt == 10 && &buf[..10] == b"HOLE_PUNCH" {
                             active_peers_rx
@@ -259,14 +294,12 @@ pub fn start_voice_engine(
 
                         let payload = match cipher.decrypt(nonce, ciphertext) {
                             Ok(p) => p,
-                            Err(_) => {
-                                continue;
-                            }
+                            Err(_) => continue,
                         };
 
                         active_peers_rx.lock().unwrap().entry(src).and_modify(|s| {
-                            s.last_seen = Instant::now();
-                            s.last_spoken = Instant::now();
+                            s.last_seen = now;
+                            s.last_spoken = now;
                         });
 
                         let mut pa_map = peers_audio_rx.lock().unwrap();
@@ -279,7 +312,6 @@ pub fn start_voice_engine(
                         }
 
                         pa.jb_packets.insert(seq, payload);
-
                         if pa.jb_packets.len() > 10 {
                             let first_key = *pa.jb_packets.keys().next().unwrap();
                             pa.jb_packets.remove(&first_key);
@@ -293,9 +325,15 @@ pub fn start_voice_engine(
         let cipher_tx = Aes256Gcm::new(&aes_key);
         let mut encoder = Encoder::new(48000, Channels::Mono, Application::Voip).unwrap();
         let mut input_buffer = Vec::new();
+
         let active_peers_tx = active_peers.clone();
         let is_deafened_tx = is_deafened.clone();
         let is_muted_tx = is_muted.clone();
+        let direct_rx_map_tx = direct_rx_map.clone();
+
+        let mut relay_header = Vec::with_capacity(68);
+        relay_header.extend_from_slice(secure_room_hash.as_bytes());
+        relay_header.extend_from_slice(&my_peer_id.to_be_bytes());
 
         let mut seq_num: u16 = 0;
         let mut hangover_frames = 0;
@@ -344,8 +382,25 @@ pub fn start_voice_engine(
                             final_packet.extend_from_slice(&ciphertext);
 
                             let peers = active_peers_tx.lock().unwrap();
+                            let direct_rx = direct_rx_map_tx.lock().unwrap();
+                            let now = Instant::now();
+
                             for (peer, _) in peers.iter() {
-                                let _ = socket_sender.send_to(&final_packet, peer);
+                                let last_direct = direct_rx
+                                    .get(peer)
+                                    .cloned()
+                                    .unwrap_or(now - Duration::from_secs(10));
+                                let use_relay = now.duration_since(last_direct).as_secs() > 2;
+
+                                if use_relay {
+                                    let mut relay_packet =
+                                        Vec::with_capacity(68 + final_packet.len());
+                                    relay_packet.extend_from_slice(&relay_header);
+                                    relay_packet.extend_from_slice(&final_packet);
+                                    let _ = socket_sender.send_to(&relay_packet, relay_addr);
+                                } else {
+                                    let _ = socket_sender.send_to(&final_packet, peer);
+                                }
                             }
                             seq_num = seq_num.wrapping_add(1);
                         }
@@ -375,7 +430,6 @@ pub fn start_voice_engine(
                 .iter()
                 .map(|(k, v)| (*k, v.volume))
                 .collect();
-
             let mut audio_states = peers_audio_tx.lock().unwrap();
             let mut indices = source_idx_tx.lock().unwrap();
 
@@ -400,7 +454,6 @@ pub fn start_voice_engine(
                                 pa.target_buffer -= 1;
                                 pa.good_frames = 0;
                             }
-
                             if let Ok(count) = pa.decoder.decode_float(&packet, &mut decoded, false)
                             {
                                 pa.pcm_queue.extend(&decoded[..count]);
@@ -415,7 +468,6 @@ pub fn start_voice_engine(
                                 if pa.target_buffer < 5 {
                                     pa.target_buffer += 1;
                                 }
-
                                 if let Ok(count) = pa.decoder.decode_float(&[], &mut decoded, false)
                                 {
                                     pa.pcm_queue.extend(&decoded[..count]);
@@ -461,32 +513,19 @@ pub fn start_voice_engine(
             }
         };
 
-        let input_stream = match input_device.build_input_stream(
-            &input_stream_config,
-            input_data_fn,
-            audio::err_fn,
-            None,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                *status.lock().unwrap() = format!("Не удалось запустить микрофон: {}", e);
-                return;
-            }
-        };
-        let output_stream = match output_device.build_output_stream(
-            &output_stream_config,
-            output_data_fn,
-            audio::err_fn,
-            None,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                *status.lock().unwrap() = format!("Не удалось запустить динамики: {}", e);
-                return;
-            }
-        };
+        let input_stream = input_device
+            .build_input_stream(&input_stream_config, input_data_fn, audio::err_fn, None)
+            .unwrap();
+        let output_stream = output_device
+            .build_output_stream(&output_stream_config, output_data_fn, audio::err_fn, None)
+            .unwrap();
         input_stream.play().unwrap();
         output_stream.play().unwrap();
+
+        let direct_rx_map_ping = direct_rx_map.clone();
+        let mut relay_header_ping = Vec::with_capacity(68);
+        relay_header_ping.extend_from_slice(secure_room_hash.as_bytes());
+        relay_header_ping.extend_from_slice(&my_peer_id.to_be_bytes());
 
         while !kill_signal.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(1));
@@ -495,13 +534,27 @@ pub fn start_voice_engine(
             ping_packet[..4].copy_from_slice(b"PING");
             ping_packet[4..12].copy_from_slice(&current_time_ms().to_be_bytes());
 
-            active_peers.lock().unwrap().retain(|addr, state| {
+            let mut peers = active_peers.lock().unwrap();
+            let direct_rx = direct_rx_map_ping.lock().unwrap();
+
+            peers.retain(|addr, state| {
                 if now.duration_since(state.last_seen).as_secs() > 5 {
                     peers_audio.lock().unwrap().remove(addr);
                     source_idx_map.lock().unwrap().remove(addr);
                     false
                 } else {
                     let _ = socket_sender_ping.send_to(&ping_packet, addr);
+
+                    let last_direct = direct_rx
+                        .get(addr)
+                        .cloned()
+                        .unwrap_or(now - Duration::from_secs(10));
+                    if now.duration_since(last_direct).as_secs() > 2 {
+                        let mut relay_ping = Vec::with_capacity(68 + 12);
+                        relay_ping.extend_from_slice(&relay_header_ping);
+                        relay_ping.extend_from_slice(&ping_packet);
+                        let _ = socket_sender_ping.send_to(&relay_ping, relay_addr);
+                    }
                     true
                 }
             });
