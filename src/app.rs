@@ -2,6 +2,7 @@ use crate::audio;
 use crate::models::PeerState;
 use crate::updater::{UpdateInfo, check_for_updates};
 use eframe::egui;
+use resvg::usvg;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -69,6 +70,28 @@ pub struct P2PApp {
     pub update_info: Arc<Mutex<UpdateInfo>>,
     pub show_update_dialog: bool,
     pub is_updating: bool,
+}
+
+pub fn load_icon_data() -> egui::IconData {
+    let svg_data = include_str!("../assets/icon.svg");
+
+    let fontdb = usvg::fontdb::Database::new();
+    let rtree = usvg::Tree::from_str(svg_data, &usvg::Options::default(), &fontdb).unwrap();
+
+    let size = 32;
+    let mut pixmap = tiny_skia::Pixmap::new(size, size).unwrap();
+    let transform = tiny_skia::Transform::from_scale(
+        size as f32 / rtree.size().width(),
+        size as f32 / rtree.size().height(),
+    );
+
+    resvg::render(&rtree, transform, &mut pixmap.as_mut());
+
+    egui::IconData {
+        rgba: pixmap.data().to_vec(),
+        width: size,
+        height: size,
+    }
 }
 
 impl P2PApp {
