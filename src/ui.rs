@@ -223,10 +223,16 @@ fn draw_main_screen(ctx: &egui::Context, app: &mut P2PApp) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.heading(egui::RichText::new("VVcall").strong());
+            let version = env!("CARGO_PKG_VERSION");
+            let version_color = if version.contains("beta") || version.contains("alpha") {
+                egui::Color32::YELLOW
+            } else {
+                egui::Color32::GRAY
+            };
             ui.label(
-                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                egui::RichText::new(format!("v{}", version))
                     .small()
-                    .color(egui::Color32::GRAY),
+                    .color(version_color),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -297,20 +303,20 @@ fn draw_main_screen(ctx: &egui::Context, app: &mut P2PApp) {
                         app.is_connected = true;
                         app.kill_signal.store(false, Ordering::Relaxed);
                         *app.status_text.lock().unwrap() = "Инициализация...".to_string();
-                        engine::start_voice_engine(
-                            app.config.server_url.clone(),
-                            app.config.username.clone(),
-                            app.room_name.clone(),
-                            app.room_password.clone(),
-                            app.config.selected_input.clone(),
-                            app.config.selected_output.clone(),
-                            app.volume_level.clone(),
-                            app.status_text.clone(),
-                            app.kill_signal.clone(),
-                            app.is_muted.clone(),
-                            app.is_deafened.clone(),
-                            app.active_peers.clone(),
-                        );
+                        engine::start_voice_engine(crate::engine::EngineArgs {
+                            server_url: app.config.server_url.clone(),
+                            username: app.config.username.clone(),
+                            room: app.room_name.clone(),
+                            room_password: app.room_password.clone(),
+                            selected_input: app.config.selected_input.clone(),
+                            selected_output: app.config.selected_output.clone(),
+                            volume_level: app.volume_level.clone(),
+                            status: app.status_text.clone(),
+                            kill_signal: app.kill_signal.clone(),
+                            is_muted: app.is_muted.clone(),
+                            is_deafened: app.is_deafened.clone(),
+                            active_peers: app.active_peers.clone(),
+                        });
                     }
                 }
 

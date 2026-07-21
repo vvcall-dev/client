@@ -52,7 +52,7 @@ jobs:
         with:
           name: Release ${{ steps.get_version.outputs.VERSION }}
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
           files: |
               target/release/vvcall-windows.exe
               target/release/p2p-voice-windows.exe
@@ -110,7 +110,7 @@ jobs:
         with:
           name: Release ${{ steps.get_version.outputs.VERSION }}
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
           files: |
               target/release/vvcall-linux
               target/release/p2p-voice-linux
@@ -172,7 +172,7 @@ jobs:
           with:
             name: Release ${{ steps.get_version.outputs.VERSION }}
             draft: false
-            prerelease: false
+            prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
             files: |
               target/${{ matrix.target }}/release/vvcall-macos-arm64
               target/${{ matrix.target }}/release/vvcall-macos-x86_64
