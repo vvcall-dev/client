@@ -7,6 +7,7 @@ use aes_gcm::{
 };
 use cpal::traits::{DeviceTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use nnnoiseless::DenoiseState;
 use opus::{Application, Channels, Decoder, Encoder};
 use rand::Rng;
 use ringbuf::{
@@ -42,18 +43,19 @@ pub struct EngineArgs {
     pub kill_signal: Arc<AtomicBool>,
     pub is_muted: Arc<AtomicBool>,
     pub is_deafened: Arc<AtomicBool>,
+    pub enable_denoise: Arc<AtomicBool>,
     pub active_peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
 }
 
 struct NetPacket {
-    src: SocketAddr,
+    peer_id: u32,
     seq: u16,
     payload: Vec<u8>,
 }
 
 pub fn start_voice_engine(args: EngineArgs) {
     std::thread::spawn(move || {
-        *args.status.lock().unwrap() = "Инициализация движка...".to_string();
+        *args.status.lock().unwrap() = "Инициализация звука...".to_string();
 
         let mic_rb = HeapRb::<f32>::new(48000 * 2);
         let (mic_prod, mic_cons) = mic_rb.split();
@@ -69,8 +71,9 @@ pub fn start_voice_engine(args: EngineArgs) {
             return;
         }
 
+        let my_peer_id: u32 = rand::random();
         spawn_audio_processor(&args, mic_cons, spk_prod, tx_net_out, rx_net_in);
-        spawn_network(&args, rx_net_out, tx_net_in);
+        spawn_network(&args, my_peer_id, rx_net_out, tx_net_in);
 
         while !args.kill_signal.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(100));
@@ -128,6 +131,7 @@ struct PeerAudio {
     buffering: bool,
     target_buffer: usize,
     good_frames: usize,
+    last_packet_time: Instant,
 }
 
 impl Default for PeerAudio {
@@ -135,11 +139,12 @@ impl Default for PeerAudio {
         Self {
             decoder: Decoder::new(48000, Channels::Mono).unwrap(),
             jb_packets: std::collections::BTreeMap::new(),
-            pcm_queue: VecDeque::with_capacity(2000),
+            pcm_queue: VecDeque::with_capacity(4000),
             next_seq: None,
             buffering: true,
-            target_buffer: 1,
+            target_buffer: 2,
             good_frames: 0,
+            last_packet_time: Instant::now(),
         }
     }
 }
@@ -152,18 +157,21 @@ fn spawn_audio_processor(
     rx_net_in: Receiver<NetPacket>,
 ) {
     let mut encoder = Encoder::new(48000, Channels::Mono, Application::Voip).unwrap();
+    let _ = encoder.set_inband_fec(true);
+    let _ = encoder.set_packet_loss_perc(10);
+
     let mut input_buffer = Vec::with_capacity(960);
-    let mut audio_states: HashMap<SocketAddr, PeerAudio> = HashMap::new();
+    let mut audio_states: HashMap<u32, PeerAudio> = HashMap::new();
 
     let is_muted = args.is_muted.clone();
     let is_deafened = args.is_deafened.clone();
     let vol_ref = args.volume_level.clone();
     let kill_signal = args.kill_signal.clone();
-    let active_peers = args.active_peers.clone();
+    let enable_denoise = args.enable_denoise.clone();
 
     std::thread::spawn(move || {
         let mut hangover_frames = 0;
-        let mut cleanup_counter = 0;
+        let mut denoiser = DenoiseState::new();
 
         while !kill_signal.load(Ordering::Relaxed) {
             while let Some(sample) = mic_cons.try_pop() {
@@ -174,6 +182,15 @@ fn spawn_audio_processor(
                 let mut chunk = [0f32; 960];
                 chunk.copy_from_slice(&input_buffer[0..960]);
                 input_buffer.drain(0..960);
+
+                if enable_denoise.load(Ordering::Relaxed) {
+                    let mut out1 = [0f32; 480];
+                    let mut out2 = [0f32; 480];
+                    let _ = denoiser.process_frame(&mut out1, &chunk[0..480]);
+                    let _ = denoiser.process_frame(&mut out2, &chunk[480..960]);
+                    chunk[0..480].copy_from_slice(&out1);
+                    chunk[480..960].copy_from_slice(&out2);
+                }
 
                 let peak = chunk.iter().fold(0.0_f32, |max, &val| max.max(val.abs()));
                 *vol_ref.lock().unwrap() = (peak * 5.0).clamp(0.0, 1.0);
@@ -199,116 +216,119 @@ fn spawn_audio_processor(
 
             while let Ok(packet) = rx_net_in.try_recv() {
                 let pa = audio_states
-                    .entry(packet.src)
+                    .entry(packet.peer_id)
                     .or_insert_with(PeerAudio::default);
 
+                let now = Instant::now();
+
+                if now.duration_since(pa.last_packet_time).as_millis() > 300 {
+                    pa.jb_packets.clear();
+                    pa.buffering = true;
+                    pa.next_seq = None;
+                }
+                pa.last_packet_time = now;
+
                 if let Some(expected) = pa.next_seq {
-                    if (packet.seq.wrapping_sub(expected) as i16) < 0 {
+                    let diff = packet.seq.wrapping_sub(expected) as i16;
+                    if diff < 0 && diff > -50 {
                         continue;
                     }
                 }
+
                 pa.jb_packets.insert(packet.seq, packet.payload);
-                if pa.jb_packets.len() > 10 {
+                if pa.jb_packets.len() > 15 {
                     let first_key = *pa.jb_packets.keys().next().unwrap();
                     pa.jb_packets.remove(&first_key);
                 }
             }
 
-            if spk_prod.vacant_len() >= 960 {
-                let active_keys: Vec<SocketAddr> = {
-                    let peers = active_peers.lock().unwrap();
-                    peers.keys().copied().collect()
-                };
-
-                let volumes: HashMap<SocketAddr, f32> = {
-                    let peers = active_peers.lock().unwrap();
-                    peers.iter().map(|(k, v)| (*k, v.volume)).collect()
-                };
-
-                cleanup_counter += 1;
-                if cleanup_counter >= 500 {
-                    audio_states.retain(|addr, _| active_keys.contains(addr));
-                    cleanup_counter = 0;
+            while spk_prod.vacant_len() >= 960 {
+                if is_deafened.load(Ordering::Relaxed) {
+                    let silence = [0.0f32; 960];
+                    let _ = spk_prod.push_slice(&silence);
+                    continue;
                 }
 
-                while spk_prod.vacant_len() >= 960 {
-                    if is_deafened.load(Ordering::Relaxed) {
-                        let silence = [0.0f32; 960];
-                        let _ = spk_prod.push_slice(&silence);
-                        continue;
-                    }
+                let mut mixed = [0f32; 960];
+                let mut has_audio = false;
 
-                    let mut mixed = [0f32; 960];
-
-                    for (addr, pa) in audio_states.iter_mut() {
-                        while pa.pcm_queue.len() < 960 {
-                            if pa.buffering {
-                                if pa.jb_packets.len() >= pa.target_buffer {
-                                    pa.buffering = false;
-                                    pa.next_seq = Some(*pa.jb_packets.keys().next().unwrap());
-                                } else {
-                                    break;
-                                }
+                for (_peer_id, pa) in audio_states.iter_mut() {
+                    while pa.pcm_queue.len() < 960 {
+                        if pa.buffering {
+                            if pa.jb_packets.len() >= pa.target_buffer {
+                                pa.buffering = false;
+                                pa.next_seq = Some(*pa.jb_packets.keys().next().unwrap());
+                            } else {
+                                break;
                             }
+                        }
 
-                            if !pa.buffering {
-                                let expected = pa.next_seq.unwrap();
-                                let mut decoded = [0f32; 960];
+                        if !pa.buffering {
+                            let expected = pa.next_seq.unwrap();
+                            let mut decoded = [0f32; 960];
 
-                                if let Some(packet) = pa.jb_packets.remove(&expected) {
-                                    pa.good_frames += 1;
-                                    if pa.good_frames > 250 && pa.target_buffer > 1 {
-                                        pa.target_buffer -= 1;
-                                        pa.good_frames = 0;
-                                    }
+                            if let Some(packet) = pa.jb_packets.remove(&expected) {
+                                pa.good_frames += 1;
+                                if pa.good_frames > 250 && pa.target_buffer > 2 {
+                                    pa.target_buffer -= 1;
+                                    pa.good_frames = 0;
+                                }
+                                if let Ok(count) =
+                                    pa.decoder.decode_float(&packet, &mut decoded, false)
+                                {
+                                    pa.pcm_queue.extend(&decoded[..count]);
+                                }
+                                pa.next_seq = Some(expected.wrapping_add(1));
+                            } else {
+                                pa.good_frames = 0;
+                                if pa.jb_packets.is_empty() {
+                                    pa.buffering = true;
+                                    break;
+                                } else {
                                     if let Ok(count) =
-                                        pa.decoder.decode_float(&packet, &mut decoded, false)
+                                        pa.decoder.decode_float(&[], &mut decoded, false)
                                     {
                                         pa.pcm_queue.extend(&decoded[..count]);
                                     }
                                     pa.next_seq = Some(expected.wrapping_add(1));
-                                } else {
-                                    pa.good_frames = 0;
-                                    if pa.jb_packets.is_empty() {
-                                        pa.buffering = true;
-                                        break;
-                                    } else {
-                                        if pa.target_buffer < 5 {
-                                            pa.target_buffer += 1;
-                                        }
-                                        if let Ok(count) =
-                                            pa.decoder.decode_float(&[], &mut decoded, false)
-                                        {
-                                            pa.pcm_queue.extend(&decoded[..count]);
-                                        }
-                                        pa.next_seq = Some(expected.wrapping_add(1));
-                                    }
                                 }
-                            }
-                        }
-
-                        let vol = volumes.get(addr).unwrap_or(&1.0);
-                        if pa.pcm_queue.len() >= 960 {
-                            for i in 0..960 {
-                                mixed[i] += pa.pcm_queue.pop_front().unwrap() * vol;
                             }
                         }
                     }
 
+                    if pa.pcm_queue.len() >= 960 {
+                        has_audio = true;
+                        for i in 0..960 {
+                            mixed[i] += pa.pcm_queue.pop_front().unwrap();
+                        }
+                    }
+                }
+
+                if has_audio {
                     for sample in mixed.iter_mut() {
                         *sample = (*sample).tanh();
                     }
                     let _ = spk_prod.push_slice(&mixed);
+                } else {
+                    let silence = [0.0f32; 960];
+                    let _ = spk_prod.push_slice(&silence);
                 }
             }
 
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(5));
         }
     });
 }
 
-fn spawn_network(args: &EngineArgs, rx_net_out: Receiver<Vec<u8>>, tx_net_in: Sender<NetPacket>) {
-    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+fn spawn_network(
+    args: &EngineArgs,
+    my_peer_id: u32,
+    rx_net_out: Receiver<Vec<u8>>,
+    tx_net_in: Sender<NetPacket>,
+) {
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("Не удалось открыть UDP сокет");
+    let socket_rx = socket.try_clone().unwrap();
+    let socket_tx = socket.try_clone().unwrap();
 
     let mut room_hasher = Sha256::new();
     room_hasher.update(format!("{}:{}", args.room, args.room_password).as_bytes());
@@ -320,8 +340,6 @@ fn spawn_network(args: &EngineArgs, rx_net_out: Receiver<Vec<u8>>, tx_net_in: Se
     let aes_key_bytes = key_hasher.finalize();
     let aes_key = Key::<Aes256Gcm>::from_slice(&aes_key_bytes).clone();
 
-    let my_peer_id: u32 = rand::random();
-
     let host = args
         .server_url
         .split(':')
@@ -329,36 +347,16 @@ fn spawn_network(args: &EngineArgs, rx_net_out: Receiver<Vec<u8>>, tx_net_in: Se
         .unwrap_or(&args.server_url);
     let relay_addr: SocketAddr = format!("{}:3031", host)
         .to_socket_addrs()
-        .unwrap()
+        .expect("Не удалось разрешить адрес сервера")
         .next()
-        .unwrap();
+        .expect("Пустой адрес сервера");
 
-    *args.status.lock().unwrap() = "Получаю IP (STUN)...".to_string();
-    let my_public_addr = match network::get_public_ip(&socket) {
-        Some(addr) => addr,
-        None => {
-            *args.status.lock().unwrap() = "Ошибка сети (STUN)".to_string();
-            args.kill_signal.store(true, Ordering::Relaxed);
-            return;
-        }
-    };
+    let mut reg_packet = Vec::with_capacity(65);
+    reg_packet.push(0xFF);
+    reg_packet.extend_from_slice(secure_room_hash.as_bytes());
+    let _ = socket.send_to(&reg_packet, relay_addr);
 
-    let secure_room_hash_rx = secure_room_hash.clone();
-
-    let mut relay_header = Vec::with_capacity(68);
-    relay_header.extend_from_slice(secure_room_hash.as_bytes());
-    relay_header.extend_from_slice(&my_peer_id.to_be_bytes());
-
-    let socket_rx = socket.try_clone().unwrap();
-    let socket_tx = socket.try_clone().unwrap();
-    let socket_ping = socket.try_clone().unwrap();
-    let socket_puncher = socket.try_clone().unwrap();
-    let socket_pong = socket.try_clone().unwrap();
-
-    let direct_rx_map = Arc::new(Mutex::new(HashMap::<SocketAddr, Instant>::new()));
-    let peer_id_map = Arc::new(Mutex::new(HashMap::<u32, SocketAddr>::new()));
-
-    *args.status.lock().unwrap() = "В комнате".to_string();
+    *args.status.lock().unwrap() = "Подключение к комнате...".to_string();
 
     let scheme = if args.server_url.contains("localhost") || args.server_url.contains("127.0.0.1") {
         "http"
@@ -372,11 +370,13 @@ fn spawn_network(args: &EngineArgs, rx_net_out: Receiver<Vec<u8>>, tx_net_in: Se
     );
 
     let (mut ws_socket, _) = connect(&ws_url).expect("Ошибка WebSocket");
-    let my_info = format!("{}|{}|{}", my_public_addr, args.username, my_peer_id);
+    let dummy_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let my_info = format!("{}|{}|{}", dummy_addr, args.username, my_peer_id);
     ws_socket.send(Message::Text(my_info.clone())).unwrap();
 
+    *args.status.lock().unwrap() = "В войсе (SFU)".to_string();
+
     let peers_ws = args.active_peers.clone();
-    let peer_id_map_ws = peer_id_map.clone();
     let my_info_clone = my_info.clone();
     let kill_signal_ws = args.kill_signal.clone();
 
@@ -386,27 +386,19 @@ fn spawn_network(args: &EngineArgs, rx_net_out: Receiver<Vec<u8>>, tx_net_in: Se
                 if text != my_info_clone {
                     let parts: Vec<&str> = text.split('|').collect();
                     if parts.len() == 3 {
-                        if let (Ok(addr), Ok(id)) =
-                            (parts[0].parse::<SocketAddr>(), parts[2].parse::<u32>())
-                        {
-                            peer_id_map_ws.lock().unwrap().insert(id, addr);
+                        if let Ok(id) = parts[2].parse::<u32>() {
+                            let fake_addr: SocketAddr =
+                                format!("127.0.0.{}:{}", (id >> 16) & 0xFF, id & 0xFFFF)
+                                    .parse()
+                                    .unwrap();
                             let mut p = peers_ws.lock().unwrap();
-                            if !p.contains_key(&addr) {
-                                p.insert(
-                                    addr,
-                                    PeerState {
-                                        name: parts[1].to_string(),
-                                        last_seen: Instant::now(),
-                                        last_spoken: Instant::now() - Duration::from_secs(10),
-                                        volume: 1.0,
-                                        ping_ms: 0,
-                                    },
-                                );
-                                for _ in 0..5 {
-                                    let _ = socket_puncher.send_to(b"HOLE_PUNCH", addr);
-                                }
-                                let _ = ws_socket.send(Message::Text(my_info_clone.clone()));
-                            }
+                            p.entry(fake_addr).or_insert_with(|| PeerState {
+                                name: parts[1].to_string(),
+                                last_seen: Instant::now(),
+                                last_spoken: Instant::now() - Duration::from_secs(10),
+                                volume: 1.0,
+                                ping_ms: 0,
+                            });
                         }
                     }
                 }
@@ -416,179 +408,87 @@ fn spawn_network(args: &EngineArgs, rx_net_out: Receiver<Vec<u8>>, tx_net_in: Se
     });
 
     let kill_signal_rx = args.kill_signal.clone();
-    let direct_rx_map_rx = direct_rx_map.clone();
-    let peer_id_map_rx = peer_id_map.clone();
-    let active_peers_rx = args.active_peers.clone();
     let cipher_rx = Aes256Gcm::new(&aes_key);
+    let active_peers_rx = args.active_peers.clone();
 
     std::thread::spawn(move || {
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; 1500];
         socket_rx
             .set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
 
         while !kill_signal_rx.load(Ordering::Relaxed) {
             match socket_rx.recv_from(&mut buf) {
-                Ok((mut amt, mut src)) => {
-                    let now = Instant::now();
-
-                    if src == relay_addr {
-                        if amt > 68 {
-                            let hash_str = String::from_utf8_lossy(&buf[..64]);
-                            if hash_str == secure_room_hash_rx {
-                                let peer_id =
-                                    u32::from_be_bytes([buf[64], buf[65], buf[66], buf[67]]);
-                                if let Some(&addr) = peer_id_map_rx.lock().unwrap().get(&peer_id) {
-                                    src = addr;
-                                    buf.copy_within(68..amt, 0);
-                                    amt -= 68;
-                                } else {
-                                    continue;
-                                }
-                            } else {
-                                continue;
-                            }
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        direct_rx_map_rx.lock().unwrap().insert(src, now);
+                Ok((amt, src)) => {
+                    if src != relay_addr {
+                        continue;
+                    }
+                    if amt < 1 + 4 + 2 + 12 + 16 || buf[0] != 0x01 {
+                        continue;
                     }
 
-                    if amt == 10 && &buf[..10] == b"HOLE_PUNCH" {
+                    let peer_id = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                    let seq = u16::from_be_bytes([buf[5], buf[6]]);
+                    let nonce = Nonce::from_slice(&buf[7..19]);
+
+                    if let Ok(payload) = cipher_rx.decrypt(nonce, &buf[19..amt]) {
+                        let fake_addr: SocketAddr =
+                            format!("127.0.0.{}:{}", (peer_id >> 16) & 0xFF, peer_id & 0xFFFF)
+                                .parse()
+                                .unwrap();
+                        let now = Instant::now();
                         active_peers_rx
                             .lock()
                             .unwrap()
-                            .entry(src)
-                            .and_modify(|s| s.last_seen = now);
-                        continue;
-                    }
-                    if amt == 12 && &buf[..4] == b"PING" {
-                        active_peers_rx
-                            .lock()
-                            .unwrap()
-                            .entry(src)
-                            .and_modify(|s| s.last_seen = now);
-                        let mut pong = [0u8; 12];
-                        pong[..4].copy_from_slice(b"PONG");
-                        pong[4..12].copy_from_slice(&buf[4..12]);
-                        let _ = socket_pong.send_to(&pong, src);
-                        continue;
-                    }
-                    if amt == 12 && &buf[..4] == b"PONG" {
-                        let mut ts_bytes = [0u8; 8];
-                        ts_bytes.copy_from_slice(&buf[4..12]);
-                        let sent_time = u64::from_be_bytes(ts_bytes);
-                        active_peers_rx.lock().unwrap().entry(src).and_modify(|s| {
-                            s.last_seen = now;
-                            s.ping_ms = current_time_ms().saturating_sub(sent_time) as u32;
-                        });
-                        continue;
-                    }
-                    if amt < 30 {
-                        continue;
-                    }
+                            .entry(fake_addr)
+                            .and_modify(|s| {
+                                s.last_seen = now;
+                                s.last_spoken = now;
+                            });
 
-                    let seq = u16::from_be_bytes([buf[0], buf[1]]);
-                    let nonce = Nonce::from_slice(&buf[2..14]);
-
-                    if let Ok(payload) = cipher_rx.decrypt(nonce, &buf[14..amt]) {
-                        active_peers_rx.lock().unwrap().entry(src).and_modify(|s| {
-                            s.last_seen = now;
-                            s.last_spoken = now;
+                        let _ = tx_net_in.send(NetPacket {
+                            peer_id,
+                            seq,
+                            payload,
                         });
-                        let _ = tx_net_in.send(NetPacket { src, seq, payload });
                     }
                 }
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::ConnectionReset {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                }
+                Err(_) => {}
             }
         }
     });
 
-    let active_peers_tx = args.active_peers.clone();
-    let direct_rx_map_tx = direct_rx_map.clone();
     let cipher_tx = Aes256Gcm::new(&aes_key);
     let kill_signal_tx = args.kill_signal.clone();
-    let relay_header_tx = relay_header.clone();
+    let reg_packet_clone = reg_packet.clone();
 
     std::thread::spawn(move || {
         let mut seq_num: u16 = 0;
+        let mut last_keepalive = Instant::now();
 
         while !kill_signal_tx.load(Ordering::Relaxed) {
+            if last_keepalive.elapsed().as_secs() >= 3 {
+                let _ = socket_tx.send_to(&reg_packet_clone, relay_addr);
+                last_keepalive = Instant::now();
+            }
+
             if let Ok(opus_payload) = rx_net_out.recv_timeout(Duration::from_millis(100)) {
                 let mut nonce_bytes = [0u8; 12];
                 rand::thread_rng().fill(&mut nonce_bytes);
                 let nonce = Nonce::from_slice(&nonce_bytes);
 
                 if let Ok(ciphertext) = cipher_tx.encrypt(nonce, opus_payload.as_slice()) {
-                    let mut final_packet = Vec::with_capacity(2 + 12 + ciphertext.len());
-                    final_packet.extend_from_slice(&seq_num.to_be_bytes());
-                    final_packet.extend_from_slice(&nonce_bytes);
-                    final_packet.extend_from_slice(&ciphertext);
+                    let mut packet = Vec::with_capacity(1 + 4 + 2 + 12 + ciphertext.len());
+                    packet.push(0x01);
+                    packet.extend_from_slice(&my_peer_id.to_be_bytes());
+                    packet.extend_from_slice(&seq_num.to_be_bytes());
+                    packet.extend_from_slice(&nonce_bytes);
+                    packet.extend_from_slice(&ciphertext);
 
-                    let peers = active_peers_tx.lock().unwrap();
-                    let direct_rx = direct_rx_map_tx.lock().unwrap();
-                    let now = Instant::now();
-
-                    for (peer, _) in peers.iter() {
-                        let last_direct = direct_rx
-                            .get(peer)
-                            .cloned()
-                            .unwrap_or(now - Duration::from_secs(10));
-                        if now.duration_since(last_direct).as_secs() > 2 {
-                            let mut relay_packet = Vec::with_capacity(68 + final_packet.len());
-                            relay_packet.extend_from_slice(&relay_header_tx);
-                            relay_packet.extend_from_slice(&final_packet);
-                            let _ = socket_tx.send_to(&relay_packet, relay_addr);
-                        } else {
-                            let _ = socket_tx.send_to(&final_packet, peer);
-                        }
-                    }
+                    let _ = socket_tx.send_to(&packet, relay_addr);
                     seq_num = seq_num.wrapping_add(1);
                 }
             }
-        }
-    });
-
-    let kill_signal_ping = args.kill_signal.clone();
-    let active_peers_ping = args.active_peers.clone();
-    let relay_header_ping = relay_header.clone();
-
-    std::thread::spawn(move || {
-        while !kill_signal_ping.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs(1));
-            let now = Instant::now();
-            let mut ping_packet = [0u8; 12];
-            ping_packet[..4].copy_from_slice(b"PING");
-            ping_packet[4..12].copy_from_slice(&current_time_ms().to_be_bytes());
-
-            let mut peers = active_peers_ping.lock().unwrap();
-            let mut direct_rx = direct_rx_map.lock().unwrap();
-
-            direct_rx.retain(|_, last_seen| now.duration_since(*last_seen).as_secs() < 15);
-
-            peers.retain(|addr, state| {
-                if now.duration_since(state.last_seen).as_secs() > 5 {
-                    false
-                } else {
-                    let _ = socket_ping.send_to(&ping_packet, addr);
-                    let last_direct = direct_rx
-                        .get(addr)
-                        .cloned()
-                        .unwrap_or(now - Duration::from_secs(10));
-                    if now.duration_since(last_direct).as_secs() > 2 {
-                        let mut relay_ping = Vec::with_capacity(68 + 12);
-                        relay_ping.extend_from_slice(&relay_header_ping);
-                        relay_ping.extend_from_slice(&ping_packet);
-                        let _ = socket_ping.send_to(&relay_ping, relay_addr);
-                    }
-                    true
-                }
-            });
         }
     });
 }

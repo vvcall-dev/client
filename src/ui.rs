@@ -316,6 +316,7 @@ fn draw_main_screen(ctx: &egui::Context, app: &mut P2PApp) {
                             kill_signal: app.kill_signal.clone(),
                             is_muted: app.is_muted.clone(),
                             is_deafened: app.is_deafened.clone(),
+                            enable_denoise: app.enable_denoise.clone(),
                             active_peers: app.active_peers.clone(),
                         });
                     }
@@ -507,6 +508,14 @@ fn draw_settings_content(ui: &mut egui::Ui, app: &mut P2PApp, lang: Language) {
             ui.separator();
 
             ui.checkbox(&mut app.config.show_overlay, tr("overlay", lang));
+
+            if ui
+                .checkbox(&mut app.config.enable_denoise, "Шумоподавление (RNNoise)")
+                .changed()
+            {
+                app.enable_denoise
+                    .store(app.config.enable_denoise, Ordering::Relaxed);
+            }
             ui.separator();
 
             if ui

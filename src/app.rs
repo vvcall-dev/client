@@ -47,6 +47,7 @@ pub struct AppConfig {
     pub selected_input: String,
     pub selected_output: String,
     pub show_overlay: bool,
+    pub enable_denoise: bool,
     pub language: Language,
 }
 
@@ -59,6 +60,7 @@ impl Default for AppConfig {
             selected_input: "".to_string(),
             selected_output: "".to_string(),
             show_overlay: false,
+            enable_denoise: true,
             language: Language::Russian,
         }
     }
@@ -84,6 +86,7 @@ pub struct P2PApp {
     pub kill_signal: Arc<AtomicBool>,
     pub is_muted: Arc<AtomicBool>,
     pub is_deafened: Arc<AtomicBool>,
+    pub enable_denoise: Arc<AtomicBool>,
     pub active_peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     pub available_inputs: Vec<String>,
     pub available_outputs: Vec<String>,
@@ -168,6 +171,8 @@ impl P2PApp {
                 .unwrap_or_else(|| "Нет устройств".into());
         }
 
+        let enable_denoise_flag = Arc::new(AtomicBool::new(config.enable_denoise));
+
         Self {
             config,
             show_settings: false,
@@ -185,6 +190,7 @@ impl P2PApp {
             kill_signal: Arc::new(AtomicBool::new(false)),
             is_muted: Arc::new(AtomicBool::new(false)),
             is_deafened: Arc::new(AtomicBool::new(false)),
+            enable_denoise: enable_denoise_flag,
             active_peers: Arc::new(Mutex::new(HashMap::new())),
             available_inputs: inputs,
             available_outputs: outputs,
