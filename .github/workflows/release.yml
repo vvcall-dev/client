@@ -2,6 +2,8 @@ name: Build and Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -29,31 +31,30 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          cache-targets: "release"
-          workspaces: "."
-          shared-key: "windows-release"
+          shared-key: "windows-build"
 
       - name: Build Release
         run: cargo build --release
 
       - name: Get version from tag
+        if: startsWith(github.ref, 'refs/tags/')
         id: get_version
         shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
       - name: Rename binary for release
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
-        run: |
-          cp target/release/vvcall.exe target/release/vvcall-windows.exe
+        run: cp target/release/vvcall.exe target/release/vvcall-windows.exe
 
       - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ steps.get_version.outputs.VERSION }}
           draft: false
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
-          files: |
-              target/release/vvcall-windows.exe
+          files: target/release/vvcall-windows.exe
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,91 +86,85 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          cache-targets: "release"
-          workspaces: "."
-          shared-key: "linux-release"
+          shared-key: "linux-build"
 
       - name: Build
         run: cargo build --release
 
       - name: Get version from tag
+        if: startsWith(github.ref, 'refs/tags/')
         id: get_version
         shell: bash
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
       - name: Rename binary for release
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
-        run: |
-            cp target/release/vvcall target/release/vvcall-linux
+        run: cp target/release/vvcall target/release/vvcall-linux
 
       - name: Upload Linux Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ steps.get_version.outputs.VERSION }}
+          draft: false
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
+          files: target/release/vvcall-linux
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    name: Build macOS Release
+    runs-on: macos-latest
+
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: 3.5
+
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "macos-${{ matrix.target }}"
+
+      - name: Build Release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Get version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        id: get_version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Rename binary for release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          SUFFIX=$([[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]] && echo "arm64" || echo "x86_64")
+          cp target/${{ matrix.target }}/release/vvcall target/${{ matrix.target }}/release/vvcall-macos-$SUFFIX
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ steps.get_version.outputs.VERSION }}
           draft: false
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
           files: |
-              target/release/vvcall-linux
-          generate_release_notes: false
+            target/${{ matrix.target }}/release/vvcall-macos-arm64
+            target/${{ matrix.target }}/release/vvcall-macos-x86_64
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: vvcall-linux
-          path: target/release/vvcall-linux
-
-  build-macos:
-      name: Build macOS Release
-      runs-on: macos-latest
-
-      env:
-        CMAKE_POLICY_VERSION_MINIMUM: 3.5
-
-      strategy:
-        matrix:
-          target: [aarch64-apple-darwin, x86_64-apple-darwin]
-
-      steps:
-        - name: Checkout code
-          uses: actions/checkout@v4
-
-        - name: Install Rust
-          uses: dtolnay/rust-toolchain@stable
-          with:
-            toolchain: stable
-            targets: ${{ matrix.target }}
-
-        - name: Rust Cache
-          uses: Swatinem/rust-cache@v2
-          with:
-            cache-targets: "release"
-            workspaces: "."
-            shared-key: "macos-release-${{ matrix.target }}"
-
-        - name: Build Release
-          run: cargo build --release --target ${{ matrix.target }}
-
-        - name: Get version from tag
-          id: get_version
-          shell: bash
-          run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-        - name: Rename binary for release
-          shell: bash
-          run: |
-            SUFFIX=$([[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]] && echo "arm64" || echo "x86_64")
-            cp target/${{ matrix.target }}/release/vvcall target/${{ matrix.target }}/release/vvcall-macos-$SUFFIX
-
-        - name: Create Release
-          uses: softprops/action-gh-release@v2
-          with:
-            name: Release ${{ steps.get_version.outputs.VERSION }}
-            draft: false
-            prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
-            files: |
-              target/${{ matrix.target }}/release/vvcall-macos-arm64
-              target/${{ matrix.target }}/release/vvcall-macos-x86_64
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
