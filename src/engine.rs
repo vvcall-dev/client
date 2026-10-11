@@ -60,7 +60,7 @@ pub fn start_voice_engine(args: EngineArgs) {
         let mic_rb = HeapRb::<f32>::new(48000 * 2);
         let (mic_prod, mic_cons) = mic_rb.split();
 
-        let spk_rb = HeapRb::<f32>::new(48000 * 2);
+        let spk_rb = HeapRb::<f32>::new(960 * 3);
         let (spk_prod, spk_cons) = spk_rb.split();
 
         let (tx_net_out, rx_net_out) = unbounded::<Vec<u8>>();
@@ -139,10 +139,10 @@ impl Default for PeerAudio {
         Self {
             decoder: Decoder::new(48000, Channels::Mono).unwrap(),
             jb_packets: std::collections::BTreeMap::new(),
-            pcm_queue: VecDeque::with_capacity(4000),
+            pcm_queue: VecDeque::with_capacity(2000),
             next_seq: None,
             buffering: true,
-            target_buffer: 2,
+            target_buffer: 1,
             good_frames: 0,
             last_packet_time: Instant::now(),
         }
@@ -244,9 +244,7 @@ fn spawn_audio_processor(
 
             while spk_prod.vacant_len() >= 960 {
                 if is_deafened.load(Ordering::Relaxed) {
-                    let silence = [0.0f32; 960];
-                    let _ = spk_prod.push_slice(&silence);
-                    continue;
+                    break;
                 }
 
                 let mut mixed = [0f32; 960];
@@ -269,7 +267,7 @@ fn spawn_audio_processor(
 
                             if let Some(packet) = pa.jb_packets.remove(&expected) {
                                 pa.good_frames += 1;
-                                if pa.good_frames > 250 && pa.target_buffer > 2 {
+                                if pa.good_frames > 250 && pa.target_buffer > 1 {
                                     pa.target_buffer -= 1;
                                     pa.good_frames = 0;
                                 }
@@ -310,8 +308,7 @@ fn spawn_audio_processor(
                     }
                     let _ = spk_prod.push_slice(&mixed);
                 } else {
-                    let silence = [0.0f32; 960];
-                    let _ = spk_prod.push_slice(&silence);
+                    break;
                 }
             }
 
