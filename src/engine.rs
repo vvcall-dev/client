@@ -1,6 +1,5 @@
 use crate::audio;
 use crate::models::PeerState;
-use crate::network;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -21,15 +20,15 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tungstenite::{Message, connect};
 
-fn current_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
+// fn current_time_ms() -> u64 {
+//     SystemTime::now()
+//         .duration_since(UNIX_EPOCH)
+//         .unwrap()
+//         .as_millis() as u64
+// }
 
 pub struct EngineArgs {
     pub server_url: String,
@@ -379,26 +378,44 @@ fn spawn_network(
 
     std::thread::spawn(move || {
         while !kill_signal_ws.load(Ordering::Relaxed) {
-            if let Ok(Message::Text(text)) = ws_socket.read() {
-                if text != my_info_clone {
-                    let parts: Vec<&str> = text.split('|').collect();
-                    if parts.len() == 3 {
-                        if let Ok(id) = parts[2].parse::<u32>() {
-                            let fake_addr: SocketAddr =
-                                format!("127.0.0.{}:{}", (id >> 16) & 0xFF, id & 0xFFFF)
-                                    .parse()
-                                    .unwrap();
-                            let mut p = peers_ws.lock().unwrap();
-                            p.entry(fake_addr).or_insert_with(|| PeerState {
-                                name: parts[1].to_string(),
-                                last_seen: Instant::now(),
-                                last_spoken: Instant::now() - Duration::from_secs(10),
-                                volume: 1.0,
-                                ping_ms: 0,
-                            });
+            match ws_socket.read() {
+                Ok(Message::Text(text)) => {
+                    if text != my_info_clone {
+                        let parts: Vec<&str> = text.split('|').collect();
+                        if parts.len() == 3 {
+                            if let Ok(id) = parts[2].parse::<u32>() {
+                                let fake_addr: SocketAddr =
+                                    format!("127.0.0.{}:{}", (id >> 16) & 0xFF, id & 0xFFFF)
+                                        .parse()
+                                        .unwrap();
+
+                                let mut p = peers_ws.lock().unwrap();
+                                let is_new = !p.contains_key(&fake_addr);
+
+                                p.entry(fake_addr)
+                                    .and_modify(|s| {
+                                        s.name = parts[1].to_string();
+                                        s.last_seen = Instant::now();
+                                    })
+                                    .or_insert_with(|| PeerState {
+                                        name: parts[1].to_string(),
+                                        last_seen: Instant::now(),
+                                        last_spoken: Instant::now() - Duration::from_secs(10),
+                                        volume: 1.0,
+                                        ping_ms: 0,
+                                    });
+
+                                if is_new {
+                                    let _ = ws_socket.send(Message::Text(my_info_clone.clone()));
+                                }
+                            }
                         }
                     }
                 }
+                Ok(Message::Ping(payload)) => {
+                    let _ = ws_socket.send(Message::Pong(payload));
+                }
+                _ => {}
             }
         }
         let _ = ws_socket.close(None);
@@ -434,6 +451,7 @@ fn spawn_network(
                                 .parse()
                                 .unwrap();
                         let now = Instant::now();
+
                         active_peers_rx
                             .lock()
                             .unwrap()
@@ -441,6 +459,13 @@ fn spawn_network(
                             .and_modify(|s| {
                                 s.last_seen = now;
                                 s.last_spoken = now;
+                            })
+                            .or_insert_with(|| PeerState {
+                                name: "Собеседник".to_string(),
+                                last_seen: now,
+                                last_spoken: now,
+                                volume: 1.0,
+                                ping_ms: 0,
                             });
 
                         let _ = tx_net_in.send(NetPacket {
