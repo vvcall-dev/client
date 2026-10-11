@@ -45,17 +45,15 @@ jobs:
         shell: bash
         run: |
           cp target/release/vvcall.exe target/release/vvcall-windows.exe
-          cp target/release/vvcall.exe target/release/p2p-voice-windows.exe
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ steps.get_version.outputs.VERSION }}
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
           files: |
               target/release/vvcall-windows.exe
-              target/release/p2p-voice-windows.exe
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -103,17 +101,15 @@ jobs:
         shell: bash
         run: |
             cp target/release/vvcall target/release/vvcall-linux
-            cp target/release/vvcall target/release/p2p-voice-linux
 
       - name: Upload Linux Release
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ steps.get_version.outputs.VERSION }}
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
           files: |
               target/release/vvcall-linux
-              target/release/p2p-voice-linux
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -165,18 +161,15 @@ jobs:
           run: |
             SUFFIX=$([[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]] && echo "arm64" || echo "x86_64")
             cp target/${{ matrix.target }}/release/vvcall target/${{ matrix.target }}/release/vvcall-macos-$SUFFIX
-            cp target/${{ matrix.target }}/release/vvcall target/${{ matrix.target }}/release/p2p-voice-macos-$SUFFIX
 
         - name: Create Release
           uses: softprops/action-gh-release@v2
           with:
             name: Release ${{ steps.get_version.outputs.VERSION }}
             draft: false
-            prerelease: false
+            prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'rc') || contains(github.ref, 'alpha') }}
             files: |
               target/${{ matrix.target }}/release/vvcall-macos-arm64
               target/${{ matrix.target }}/release/vvcall-macos-x86_64
-              target/${{ matrix.target }}/release/p2p-voice-macos-arm64
-              target/${{ matrix.target }}/release/p2p-voice-macos-x86_64
           env:
             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

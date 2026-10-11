@@ -3,6 +3,7 @@ use crate::models::PeerState;
 use crate::updater::{UpdateInfo, check_for_updates};
 use eframe::egui;
 use resvg::usvg;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -46,6 +47,7 @@ pub struct AppConfig {
     pub selected_input: String,
     pub selected_output: String,
     pub show_overlay: bool,
+    pub enable_denoise: bool,
     pub language: Language,
 }
 
@@ -58,6 +60,7 @@ impl Default for AppConfig {
             selected_input: "".to_string(),
             selected_output: "".to_string(),
             show_overlay: false,
+            enable_denoise: true,
             language: Language::Russian,
         }
     }
@@ -83,11 +86,13 @@ pub struct P2PApp {
     pub kill_signal: Arc<AtomicBool>,
     pub is_muted: Arc<AtomicBool>,
     pub is_deafened: Arc<AtomicBool>,
+    pub enable_denoise: Arc<AtomicBool>,
     pub active_peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     pub available_inputs: Vec<String>,
     pub available_outputs: Vec<String>,
     pub update_info: Arc<Mutex<UpdateInfo>>,
     pub show_update_dialog: bool,
+    pub update_declined: bool,
     pub is_updating: bool,
 }
 
@@ -166,6 +171,8 @@ impl P2PApp {
                 .unwrap_or_else(|| "Нет устройств".into());
         }
 
+        let enable_denoise_flag = Arc::new(AtomicBool::new(config.enable_denoise));
+
         Self {
             config,
             show_settings: false,
@@ -183,11 +190,13 @@ impl P2PApp {
             kill_signal: Arc::new(AtomicBool::new(false)),
             is_muted: Arc::new(AtomicBool::new(false)),
             is_deafened: Arc::new(AtomicBool::new(false)),
+            enable_denoise: enable_denoise_flag,
             active_peers: Arc::new(Mutex::new(HashMap::new())),
             available_inputs: inputs,
             available_outputs: outputs,
             update_info,
             show_update_dialog: false,
+            update_declined: false,
             is_updating: false,
         }
     }
@@ -262,11 +271,17 @@ impl eframe::App for P2PApp {
             }
         }
 
-        if !self.show_update_dialog {
-            let info = self.update_info.lock().unwrap();
-            if let Some(latest) = &info.latest_version {
-                if latest != &info.current_version {
-                    self.show_update_dialog = true;
+        if !self.show_update_dialog && !self.update_declined {
+            if let Ok(info) = self.update_info.try_lock() {
+                if let Some(latest_str) = &info.latest_version {
+                    let current_res = Version::parse(&info.current_version.trim_start_matches('v'));
+                    let latest_res = Version::parse(latest_str.trim_start_matches('v'));
+
+                    if let (Ok(current), Ok(latest)) = (current_res, latest_res) {
+                        if latest > current {
+                            self.show_update_dialog = true;
+                        }
+                    }
                 }
             }
         }
